@@ -178,65 +178,32 @@ def extract_first_card_details(group_str: str):
 
 def get_predicted_suit(base_suit: str, card_value: str, game_number: int) -> str:
     """
-    Applique la transformation selon la nouvelle règle complexe (N, Couleur de base, Parité de la carte).
+    Applique la transformation selon la règle simple que nous avons établie :
+    La prédiction dépend UNIQUEMENT de la parité du numéro de jeu (N),
+    et ignore la parité de la carte.
     """
     normalized_suit = normalize_suit(base_suit)
     is_odd_game = is_odd(game_number)
-    
-    # Vérification de la valeur de la carte
-    if not card_value:
-        # S'il n'y a pas de valeur, on suppose IMPAIRE par défaut
-        is_value_odd = True
-        logger.warning(f"Jeu #{game_number}: Valeur de carte manquante pour la base {base_suit}. Défaut: IMPAIRE.")
-    else:
-        is_value_odd = is_card_value_odd(card_value) 
-    
+
     H = '♥' # Coeur (❤️)
     S = '♠' # Pique (♠️)
     D = '♦' # Carreau (♦️)
     C = '♣' # Trèfle (♣️)
     
-    # --- Jeux PAIRS (is_odd_game est False) ---
-    if not is_odd_game:
-        # 1. Enseigne : H ou S (❤️ ou ♠️)
-        if normalized_suit in [H, S]:
-            if not is_value_odd: # Valeur PAIRE (2, 4, 6, 8, 10, Q)
-                # ♠️ → ♣️ et ❤️ → ♦️
-                return {'♠': C, '♥': D}.get(normalized_suit, normalized_suit)
-            else: # Valeur IMPAIRE (A, 3, 5, 7, 9, J, K)
-                # ♠️ → ♠️ et ❤️ → ❤️ (Aucune transformation)
-                return normalized_suit
-        
-        # 2. Enseigne : D ou C (♦️ ou ♣️)
-        elif normalized_suit in [D, C]:
-            if not is_value_odd: # Valeur PAIRE (2, 4, 6, 8, 10, Q)
-                # ♦️ → ♠️ et ♣️ → ❤️
-                return {'♦': S, '♣': H}.get(normalized_suit, normalized_suit)
-            else: # Valeur IMPAIRE (A, 3, 5, 7, 9, J, K)
-                # ♦️ → ♣️ et ♣️ → ♦️
-                return {'♦': C, '♣': D}.get(normalized_suit, normalized_suit)
-
-    # --- Jeux IMPAIRS (is_odd_game est True) ---
-    else:
-        # 1. Enseigne : H ou S (❤️ ou ♠️)
-        if normalized_suit in [H, S]:
-            if not is_value_odd: # Valeur PAIRE (2, 4, 6, 8, 10, Q)
-                # ♠️ → ❤️ et ❤️ → ♣️
-                return {'♠': H, '♥': C}.get(normalized_suit, normalized_suit)
-            else: # Valeur IMPAIRE (A, 3, 5, 7, 9, J, K)
-                # ♠️ → ♦️ et ❤️ → ♠️
-                return {'♠': D, '♥': S}.get(normalized_suit, normalized_suit)
-        
-        # 2. Enseigne : D ou C (♦️ ou ♣️)
-        elif normalized_suit in [D, C]:
-            if not is_value_odd: # Valeur PAIRE (2, 4, 6, 8, 10, Q)
-                # ♦️ → ❤️ et ♣️ → ♠️
-                return {'♦': H, '♣': S}.get(normalized_suit, normalized_suit)
-            else: # Valeur IMPAIRE (A, 3, 5, 7, 9, J, K)
-                # ♦️ → ♦️ et ♣️ → ♣️ (Aucune transformation)
-                return normalized_suit
+    # --- Mappings Simples Basés sur N Parité ---
     
-    return normalized_suit
+    # N PAIR (is_odd_game est False): Swap Red/Black (♠️<->♣️ et ❤️<->♦️)
+    # Ceci correspond à SUIT_MAPPING_EVEN: {'♠': '♣', '♣': '♠', '♦': '♥', '♥': '♦'}
+    MAPPING_EVEN = {S: C, C: S, H: D, D: H}
+    
+    # N IMPAIR (is_odd_game est True): Swap Pique/Coeur et Carreau/Trèfle (♠️<->❤️ et ♦️<->♣️)
+    # Ceci correspond à SUIT_MAPPING_ODD: {'♠': '♥', '♣': '♦', '♦': '♣', '♥': '♠'}
+    MAPPING_ODD = {S: H, H: S, D: C, C: D}
+
+    if not is_odd_game: # Jeux PAIRS
+        return MAPPING_EVEN.get(normalized_suit, normalized_suit)
+    else: # Jeux IMPAIRS
+        return MAPPING_ODD.get(normalized_suit, normalized_suit)
 
 # --- Logique de Prédiction (Immédiate) ---
 
@@ -732,8 +699,8 @@ async def cmd_help(event):
 
     await event.respond("""📖 **Aide - Bot de Prédiction Baccarat**
 
-**Règles de prédiction:**
-La transformation dépend de la **parité du jeu (N)** et de la **parité de la carte (Paire/Impaire)**. La prédiction est TOUJOURS pour le jeu **N + A_OFFSET** (où N est le jeu source).
+**Règles de prédiction (Mise à jour):**
+La transformation dépend **UNIQUEMENT** de la parité du jeu (N) et applique un mapping simple (♠️<->♣️, ❤️<->♦️ si N est pair, ou ♠️<->❤️, ♦️<->♣️ si N est impair). La prédiction est TOUJOURS pour le jeu **N + A_OFFSET** (où N est le jeu source).
 
 **Vérification:**
 Vérifie si le costume prédit est dans le PREMIER groupe pour les jeux **N+0 à N+R_OFFSET**.
