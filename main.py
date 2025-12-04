@@ -13,7 +13,7 @@ from aiohttp import web
 from config import (
     API_ID, API_HASH, BOT_TOKEN, ADMIN_ID,
     SOURCE_CHANNEL_ID, PREDICTION_CHANNEL_ID, PORT,
-    SUIT_MAPPING_EVEN, SUIT_MAPPING_ODD, ALL_SUITS, SUIT_DISPLAY, SUIT_NORMALIZE,
+    SUIT_DISPLAY, SUIT_NORMALIZE,
     A_OFFSET_DEFAULT, R_OFFSET_DEFAULT, VERIFICATION_EMOJIS
 )
 
@@ -153,7 +153,7 @@ def suit_in_group(group_str: str, target_suit: str) -> bool:
             return True
     return False
 
-# --- Fonctions d'Extraction Avancée et de Logique de Carte ---
+# --- Fonctions d'Extraction Avancée et de Logique de Carte (RÈGLES COMPLEXES) ---
 
 CARD_VALUES_ODD = {'A', '3', '5', '7', '9', 'J', 'K'}
 CARD_VALUES_EVEN = {'2', '4', '6', '8', 'T', '10', 'Q'} 
@@ -178,13 +178,18 @@ def extract_first_card_details(group_str: str):
 
 def get_predicted_suit(base_suit: str, card_value: str, game_number: int) -> str:
     """
-    Applique la transformation selon la nouvelle règle complexe.
+    Applique la transformation selon la nouvelle règle complexe (N, Couleur de base, Parité de la carte).
     """
     normalized_suit = normalize_suit(base_suit)
     is_odd_game = is_odd(game_number)
     
-    # Si la valeur n'est pas trouvée, on suppose IMPAIRE pour éviter de casser la logique
-    is_value_odd = is_card_value_odd(card_value) if card_value else True 
+    # Vérification de la valeur de la carte
+    if not card_value:
+        # S'il n'y a pas de valeur, on suppose IMPAIRE par défaut
+        is_value_odd = True
+        logger.warning(f"Jeu #{game_number}: Valeur de carte manquante pour la base {base_suit}. Défaut: IMPAIRE.")
+    else:
+        is_value_odd = is_card_value_odd(card_value) 
     
     H = '♥' # Coeur (❤️)
     S = '♠' # Pique (♠️)
@@ -241,7 +246,6 @@ async def send_prediction_to_channel(target_game: int, predicted_suit: str, base
     try:
         display_suit = SUIT_DISPLAY.get(predicted_suit, predicted_suit)
         
-        # Le format complet avec la base est seulement pour la vérification réussie
         prediction_msg = f"📲Game:{target_game}:{display_suit} statut :⏳"
 
         msg_id = 0
@@ -283,9 +287,6 @@ async def update_prediction_status(game_number: int, new_status: str, verificati
         pred = pending_predictions[game_number]
         suit = pred['suit']
         display_suit = SUIT_DISPLAY.get(suit, suit)
-        base_game = pred['base_game']
-        base_suit = pred['base_suit']
-        base_display = SUIT_DISPLAY.get(base_suit, base_suit)
         
         # Calcul de l'index de vérification (N+0, N+1, N+2, ...)
         verification_index = 0
@@ -295,12 +296,9 @@ async def update_prediction_status(game_number: int, new_status: str, verificati
         if new_status == '✅':
             # Utilise l'emoji basé sur l'index de vérification
             status_emoji = VERIFICATION_EMOJIS.get(verification_index, '✅')
-            parity = "Impaire" if is_odd(base_game) else "Paire"
             
-            # Message de statut COMPLET pour le succès
-            updated_msg = f"""📲Game:{game_number}:{display_suit} statut :{status_emoji}
-⚜🟩validé sur N+{verification_index}   premier enseigne du Banquier : {base_display} numero du jeu precedent {parity}
-{base_display}={display_suit}"""
+            # Correction: Simplification du message de succès comme demandé
+            updated_msg = f"📲Game:{game_number}:{display_suit} statut :{status_emoji}"
             
         elif new_status == '❌':
             # Message de statut SIMPLE pour l'échec
@@ -411,13 +409,17 @@ async def process_prediction(message_text: str):
                     # L'actuel game_number (e.g., 103, 107, 112) devient la nouvelle ancre
                     ec_last_source_game = game_number 
                     
-                    log_mode = f"EC (P{ec_gap_index + 1}) N + A_OFFSET, Gap {current_gap} satisfait"
+                    log_mode = f"EC (Next P) N + A_OFFSET, Gap {current_gap} satisfied by N={game_number}"
                     
                 else:
                     # Sauter: N_current est trop bas, attendre.
-                    logger.info(f"EC: Skip prediction for #{game_number}. Waiting for source game #{required_source_game} (Gap {current_gap})")
+                    logger.info(f"EC: Skip prediction for #{game_number}. Waiting for source game #{required_source_game} (Gap {current_gap}). Last anchor: #{ec_last_source_game}")
                     return # Sauter la prédiction
                     
+            if should_trigger:
+                # Sauvegarde l'état EC avant l'envoi, juste au cas où l'envoi échoue
+                save_config()
+
         else:
             # Mode A_OFFSET standard (et vérification du blocage /time)
             
@@ -448,10 +450,6 @@ async def process_prediction(message_text: str):
                 
                 await send_prediction_to_channel(target_game, predicted_suit, game_number, base_suit)
                 
-                # Sauvegarde l'état EC après succès
-                if ec_active and ec_gaps:
-                    save_config()
-                    
             else:
                 logger.info(f"Prédiction #{target_game} déjà active ou cible trop proche de l'actuel ({current_game_number})")
 
@@ -463,6 +461,8 @@ async def process_prediction(message_text: str):
 async def process_verification(message_text: str):
     """
     VÉRIFICATION: Attend que le message soit finalisé.
+    Vérifie si le costume prédit est dans le PREMIER groupe.
+    Gère la vérification sur N+0 à N+R_OFFSET.
     """
     try:
         if not is_message_finalized(message_text):
@@ -490,12 +490,13 @@ async def process_verification(message_text: str):
         
         # --- LOGIQUE DE VÉRIFICATION SUR R_OFFSET ESSAIS ---
         
-        # La vérification n'est PAS affectée par /time ou /ec
+        # Parcourir les prédictions en attente (pending_predictions)
         for pred_game_number, pred in list(pending_predictions.items()):
             target_suit = pred['suit']
             r_offset = pred['r_offset']
             
             # Si le jeu actuel est dans la fenêtre de vérification (de N+0 à N+r_offset)
+            # La fenêtre va de pred_game_number (N+0) à pred_game_number + r_offset
             if pred_game_number <= current_game_number <= pred_game_number + r_offset:
                 
                 # Vérifier si la couleur prédite est dans le PREMIER groupe
@@ -510,8 +511,9 @@ async def process_verification(message_text: str):
                     await update_prediction_status(pred_game_number, '❌')
                 
                 else:
-                    # ÉCHEC (Essai non final)
+                    # ÉCHEC (Essai non final), on incrémente le compteur pour le prochain jeu
                     pred['verification_attempt'] += 1
+                    # Note: On ne met pas à jour le statut du message ici, on attend soit le succès, soit l'échec final.
                     logger.info(f"⏳ Jeu #{current_game_number}: {SUIT_DISPLAY.get(target_suit, target_suit)} non trouvé. Continue vérification pour #{pred_game_number} (Essai: {pred['verification_attempt']})")
 
     except Exception as e:
@@ -922,7 +924,7 @@ async def cmd_ec(event):
                 next_required = ec_last_source_game + current_gap
                 status_msg += f"**Prochain écart utilisé:** {current_gap} (Index {ec_gap_index} / {len(ec_gaps)})\n"
                 status_msg += f"**Ancre du dernier N prédit:** #{ec_last_source_game}\n"
-                status_msg += f"**Jeu source minimum requis pour P{ec_gap_index + 2}:** **#{next_required}**"
+                status_msg += f"**Jeu source minimum requis pour la prochaine prédiction:** **#{next_required}**"
             
             status_msg += "\n\nUtilisation: `/ec 3,4,5` ou `/ec 0` pour désactiver."
         else:
@@ -996,6 +998,8 @@ API_HASH = os.getenv('API_HASH') or ''
 BOT_TOKEN = os.getenv('BOT_TOKEN') or ''
 PORT = int(os.getenv('PORT') or '10000')
 
+# Mappings simplifiés pour le code qui utilise la logique complexe
+# Ces mappings ne sont plus utilisés dans get_predicted_suit, mais peuvent l'être ailleurs ou pour la compatibilité
 SUIT_MAPPING_EVEN = {'♠': '♣', '♣': '♠', '♦': '♥', '♥': '♦'}
 SUIT_MAPPING_ODD = {'♠': '♥', '♣': '♦', '♦': '♣', '♥': '♠'}
 ALL_SUITS = ['♥', '♠', '♦', '♣']
@@ -1086,7 +1090,7 @@ openpyxl==3.1.2
 
 **Configuration par commandes:**
 - `/a [valeur]`: Offset de prédiction standard (N -> N + A_OFFSET)
-- `/r [valeur]`: Nombre d'essais de vérification (N+0 à N+R_OFFSET)
+- `/r [valeur]`: Nombre d'essais de vérification (0 à 10, défaut: 0)
 - `/time [secondes]`: Bloque temporairement les prédictions (mode standard).
 - `/ec [e1,e2,...]`: **Mode Écart Personnalisé** (Désactive/Ignore `/time`).
 
@@ -1129,7 +1133,7 @@ openpyxl==3.1.2
         await client.send_file(
             event.chat_id,
             zip_path,
-            caption=f"📦 **ren.zip**\n\nFichier prêt pour déploiement sur Render.com (port 10000)\n\n**Mise à jour majeure:**\n• **Nouvelle Logique /ec implémentée** (Écart sur le numéro de jeu source N).\n• Le mode `/ec` ignore désormais le blocage `/time`."
+            caption=f"📦 **ren.zip**\n\nFichier prêt pour déploiement sur Render.com (port 10000)\n\n**Mise à jour majeure:**\n• **Réintégration de la règle de prédiction complexe** (Parité Jeu + Parité Carte).\n• **Format du message de succès simplifié** (`📲Game:N:S statut :✅0️⃣`).\n• Réintégration des commandes `/time` et `/ec` avec persistance et logique de rotation."
         )
 
         shutil.rmtree(deploy_dir)
