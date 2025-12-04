@@ -52,27 +52,47 @@ current_game_number = 0
 source_channel_ok = False
 prediction_channel_ok = False
 transfer_enabled = True
-# NOUVEAU: Offsets de configuration persistants
 A_OFFSET = A_OFFSET_DEFAULT
 R_OFFSET = R_OFFSET_DEFAULT
 CONFIG_FILE = 'bot_config.json'
+prediction_block_until = None 
 
-# --- NOUVEAU: Fonctions de Persistance ---
+# Variables pour la commande /ec (Écart Personnalisé)
+ec_active = False
+ec_gaps = []  # Liste des écarts [3, 4, 5, ...]
+ec_gap_index = 0
+ec_last_source_game = 0 # Le numéro de jeu source (N) qui a déclenché la dernière prédiction
+ec_first_trigger_done = False # Vrai après la première prédiction P1
+
+# --- Fonctions de Persistance ---
 
 def load_config():
     """Charge la configuration depuis le fichier JSON."""
-    global A_OFFSET, R_OFFSET
+    global A_OFFSET, R_OFFSET, ec_active, ec_gaps, ec_gap_index, ec_last_source_game, ec_first_trigger_done
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                 config = json.load(f)
                 A_OFFSET = config.get('a_offset', A_OFFSET_DEFAULT)
                 R_OFFSET = config.get('r_offset', R_OFFSET_DEFAULT)
-            logger.info(f"⚙️ Configuration chargée: A_OFFSET={A_OFFSET}, R_OFFSET={R_OFFSET}")
+                # Chargement EC
+                ec_active = config.get('ec_active', False)
+                ec_gaps = config.get('ec_gaps', [])
+                ec_gap_index = config.get('ec_gap_index', 0)
+                ec_last_source_game = config.get('ec_last_source_game', 0)
+                ec_first_trigger_done = config.get('ec_first_trigger_done', False)
+                
+            logger.info(f"⚙️ Configuration chargée: A_OFFSET={A_OFFSET}, R_OFFSET={R_OFFSET}, EC_ACTIVE={ec_active}")
         except Exception as e:
             logger.error(f"Erreur chargement config: {e}")
             A_OFFSET = A_OFFSET_DEFAULT
             R_OFFSET = R_OFFSET_DEFAULT
+            # En cas d'erreur de chargement, on s'assure que EC est désactivé
+            ec_active = False
+            ec_gaps = []
+            ec_gap_index = 0
+            ec_last_source_game = 0
+            ec_first_trigger_done = False
     else:
         logger.info("⚙️ Fichier config.json non trouvé. Utilisation des valeurs par défaut.")
         save_config() # Sauvegarde les valeurs par défaut si le fichier n'existe pas
@@ -82,7 +102,13 @@ def save_config():
     try:
         config = {
             'a_offset': A_OFFSET,
-            'r_offset': R_OFFSET
+            'r_offset': R_OFFSET,
+            # Sauvegarde EC
+            'ec_active': ec_active,
+            'ec_gaps': ec_gaps,
+            'ec_gap_index': ec_gap_index,
+            'ec_last_source_game': ec_last_source_game,
+            'ec_first_trigger_done': ec_first_trigger_done
         }
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=4)
@@ -127,48 +153,32 @@ def suit_in_group(group_str: str, target_suit: str) -> bool:
             return True
     return False
 
-# --- NOUVEAU: Fonctions d'Extraction Avancée et de Logique de Carte ---
+# --- Fonctions d'Extraction Avancée et de Logique de Carte ---
 
 CARD_VALUES_ODD = {'A', '3', '5', '7', '9', 'J', 'K'}
-CARD_VALUES_EVEN = {'2', '4', '6', '8', 'T', '10', 'Q'} # 'T' pour Ten, '10' pour 10 (selon le format)
+CARD_VALUES_EVEN = {'2', '4', '6', '8', 'T', '10', 'Q'} 
 
 def is_card_value_odd(card_value: str) -> bool:
     """Détermine si la valeur de la carte est impaire (A, 3, 5, 7, 9, J, K)."""
-    # Normalisation pour '10' (qui est Pair)
     normalized_value = card_value.upper().replace('10', 'T') 
     return normalized_value in CARD_VALUES_ODD
 
 def extract_first_card_details(group_str: str):
     """Extrait la valeur et la couleur de la première carte d'un groupe."""
-    # Valeurs possibles : A, 2-9, 10, T, J, Q, K
     value_pattern = r'([A2-9JQKT]|10)?'
-    # Couleurs normalisées
     suit_pattern = r'([♠♥♦♣]|♠️|♥️|♦️|♣️|❤️|❤)'
     
     match = re.search(value_pattern + suit_pattern, group_str, re.IGNORECASE)
     
     if match:
-        # group(1) = Valeur, group(2) = Couleur
         value = match.group(1) if match.group(1) else ''
         suit = normalize_suit(match.group(2))
         return value, suit
     return None, None
 
-def get_first_suit_in_group(group_str: str) -> str:
-    """Trouve la première couleur (suit) dans un groupe. (GARDÉE mais non utilisée par la nouvelle logique)"""
-    suit_pattern = r'[♠♥♦♣]|♠️|♥️|♦️|♣️|❤️|❤'
-    match = re.search(suit_pattern, group_str)
-    if match:
-        return normalize_suit(match.group())
-    return None
-
-# --- REMPLACEMENT DE LA LOGIQUE get_predicted_suit ---
 def get_predicted_suit(base_suit: str, card_value: str, game_number: int) -> str:
     """
-    Applique la transformation selon la nouvelle règle complexe:
-    - Base_suit: '♠', '♥', '♦', '♣' (normalisée)
-    - card_value: 'A', '2', '3', ... (ou None si non trouvé)
-    - game_number: N
+    Applique la transformation selon la nouvelle règle complexe.
     """
     normalized_suit = normalize_suit(base_suit)
     is_odd_game = is_odd(game_number)
@@ -230,6 +240,8 @@ async def send_prediction_to_channel(target_game: int, predicted_suit: str, base
     global R_OFFSET
     try:
         display_suit = SUIT_DISPLAY.get(predicted_suit, predicted_suit)
+        
+        # Le format complet avec la base est seulement pour la vérification réussie
         prediction_msg = f"📲Game:{target_game}:{display_suit} statut :⏳"
 
         msg_id = 0
@@ -250,8 +262,8 @@ async def send_prediction_to_channel(target_game: int, predicted_suit: str, base
             'base_game': base_game,
             'base_suit': base_suit,
             'status': '⏳',
-            'r_offset': R_OFFSET, # NOUVEAU: Stocke l'offset R de vérification
-            'verification_attempt': 0, # NOUVEAU: Compteur d'essais
+            'r_offset': R_OFFSET, 
+            'verification_attempt': 0, 
             'created_at': datetime.now().isoformat()
         }
 
@@ -271,6 +283,9 @@ async def update_prediction_status(game_number: int, new_status: str, verificati
         pred = pending_predictions[game_number]
         suit = pred['suit']
         display_suit = SUIT_DISPLAY.get(suit, suit)
+        base_game = pred['base_game']
+        base_suit = pred['base_suit']
+        base_display = SUIT_DISPLAY.get(base_suit, base_suit)
         
         # Calcul de l'index de vérification (N+0, N+1, N+2, ...)
         verification_index = 0
@@ -280,12 +295,19 @@ async def update_prediction_status(game_number: int, new_status: str, verificati
         if new_status == '✅':
             # Utilise l'emoji basé sur l'index de vérification
             status_emoji = VERIFICATION_EMOJIS.get(verification_index, '✅')
+            parity = "Impaire" if is_odd(base_game) else "Paire"
             
-            # Message de statut SIMPLIFIÉ
-            updated_msg = f"📲Game:{game_number}:{display_suit} statut :{status_emoji}"
+            # Message de statut COMPLET pour le succès
+            updated_msg = f"""📲Game:{game_number}:{display_suit} statut :{status_emoji}
+⚜🟩validé sur N+{verification_index}   premier enseigne du Banquier : {base_display} numero du jeu precedent {parity}
+{base_display}={display_suit}"""
             
+        elif new_status == '❌':
+            # Message de statut SIMPLE pour l'échec
+            updated_msg = f"📲Game:{game_number}:{display_suit} statut :{new_status}"
         else:
             updated_msg = f"📲Game:{game_number}:{display_suit} statut :{new_status}"
+
 
         if PREDICTION_CHANNEL_ID and pred['message_id'] > 0 and prediction_channel_ok:
             try:
@@ -312,10 +334,14 @@ async def update_prediction_status(game_number: int, new_status: str, verificati
 async def process_prediction(message_text: str):
     """
     PRÉDICTION: Se fait immédiatement dès qu'un numéro est détecté.
-    N'attend PAS que le message soit finalisé.
+    Gère la logique de blocage /time et la logique de séquence /ec.
     """
-    global current_game_number, A_OFFSET
+    global current_game_number, A_OFFSET, prediction_block_until, ec_active, ec_gaps, ec_gap_index, ec_last_source_game, ec_first_trigger_done
     try:
+        current_time = datetime.now()
+        should_trigger = False
+        log_mode = ""
+        
         game_number = extract_game_number(message_text)
         if game_number is None:
             return
@@ -340,25 +366,94 @@ async def process_prediction(message_text: str):
 
         second_group = groups[1]
         
-        # NOUVEAU: Extraction de la valeur ET de la couleur
+        # Extraction de la valeur ET de la couleur
         card_value, base_suit = extract_first_card_details(second_group)
 
-        if base_suit:
-            # NOUVEAU: Appel de la nouvelle fonction de prédiction
-            predicted_suit = get_predicted_suit(base_suit, card_value, game_number)
-            target_game = game_number + A_OFFSET # Utilise A_OFFSET
+        if not base_suit:
+            logger.info(f"Jeu #{game_number}: Pas de couleur trouvée dans le 2nd groupe.")
+            return
+            
+        predicted_suit = get_predicted_suit(base_suit, card_value, game_number)
+        
+        # --- LOGIQUE DE DÉCLENCHEMENT DE LA PRÉDICTION ---
 
-            if target_game not in pending_predictions:
-                parity = "impair" if is_odd(game_number) else "pair"
+        if ec_active and ec_gaps:
+            # Mode EC activé: Priorité, ignore le blocage /time
+            
+            if not ec_first_trigger_done:
+                # P1: Première prédiction après /ec activation. Déclenchement immédiat.
+                should_trigger = True 
+                log_mode = "EC (P1 Initial) N + A_OFFSET"
+
+                # Mise à jour de l'état pour P2 après succès
+                ec_last_source_game = game_number # N=100 est l'ancre
+                # ec_gap_index reste 0 (P2 utilisera G1=3)
+                ec_first_trigger_done = True
                 
-                # NOUVEAU: Affichage de la carte complète si la valeur est trouvée
+            else:
+                # Subsequent predictions (P2, P3, P4, ...)
+                
+                # Le gap à utiliser (G1, G2, G3, ...)
+                current_gap = ec_gaps[ec_gap_index]
+                
+                # Le numéro de jeu source requis pour déclencher (e.g., 100 + 3 = 103)
+                required_source_game = ec_last_source_game + current_gap
+                
+                if game_number >= required_source_game:
+                    # Déclenchement! N_current a atteint ou dépassé le requis.
+                    should_trigger = True
+                    
+                    # --- Mise à jour de l'état pour la *prochaine* prédiction ---
+                    
+                    # Avance l'index pour la prochaine rotation (P3 utilisera G2=4)
+                    ec_gap_index = (ec_gap_index + 1) % len(ec_gaps)
+                    
+                    # L'actuel game_number (e.g., 103, 107, 112) devient la nouvelle ancre
+                    ec_last_source_game = game_number 
+                    
+                    log_mode = f"EC (P{ec_gap_index + 1}) N + A_OFFSET, Gap {current_gap} satisfait"
+                    
+                else:
+                    # Sauter: N_current est trop bas, attendre.
+                    logger.info(f"EC: Skip prediction for #{game_number}. Waiting for source game #{required_source_game} (Gap {current_gap})")
+                    return # Sauter la prédiction
+                    
+        else:
+            # Mode A_OFFSET standard (et vérification du blocage /time)
+            
+            if prediction_block_until and prediction_block_until > current_time:
+                remaining_seconds = (prediction_block_until - current_time).total_seconds()
+                logger.info(f"⏳ PRÉDICTION BLOQUÉE par /time: Reste {remaining_seconds:.1f} secondes. Ignoré pour Jeu #{game_number}")
+                return
+            
+            # Si le temps de blocage est passé, on réinitialise la variable
+            if prediction_block_until and prediction_block_until <= current_time:
+                prediction_block_until = None
+                logger.warning("Blocage des prédictions /time levé automatiquement.")
+
+            should_trigger = True
+            log_mode = f"A_OFFSET (N+{A_OFFSET})"
+
+
+        # --- Déclenchement de la Prédiction ---
+        if should_trigger:
+            target_game = game_number + A_OFFSET
+            
+            if target_game not in pending_predictions and target_game > current_game_number:
+                
+                parity = "impair" if is_odd(game_number) else "pair"
                 card_info = f"{card_value or ''}{SUIT_DISPLAY.get(base_suit, base_suit)}"
                 
-                logger.info(f"🎯 Jeu #{game_number} ({parity}): Carte {card_info} -> Prédiction #{target_game}: {predicted_suit} (N+{A_OFFSET})")
+                logger.info(f"🎯 Jeu #{game_number} ({parity}): Carte {card_info} -> Prédiction #{target_game}: {predicted_suit} ({log_mode})")
                 
                 await send_prediction_to_channel(target_game, predicted_suit, game_number, base_suit)
+                
+                # Sauvegarde l'état EC après succès
+                if ec_active and ec_gaps:
+                    save_config()
+                    
             else:
-                logger.info(f"Prédiction #{target_game} déjà active")
+                logger.info(f"Prédiction #{target_game} déjà active ou cible trop proche de l'actuel ({current_game_number})")
 
     except Exception as e:
         logger.error(f"Erreur traitement prédiction: {e}")
@@ -368,8 +463,6 @@ async def process_prediction(message_text: str):
 async def process_verification(message_text: str):
     """
     VÉRIFICATION: Attend que le message soit finalisé.
-    Vérifie si le costume prédit est dans le PREMIER groupe.
-    Gère la vérification sur N+0 à N+R_OFFSET.
     """
     try:
         if not is_message_finalized(message_text):
@@ -397,13 +490,12 @@ async def process_verification(message_text: str):
         
         # --- LOGIQUE DE VÉRIFICATION SUR R_OFFSET ESSAIS ---
         
-        # Parcourir les prédictions en attente (pending_predictions)
+        # La vérification n'est PAS affectée par /time ou /ec
         for pred_game_number, pred in list(pending_predictions.items()):
             target_suit = pred['suit']
             r_offset = pred['r_offset']
             
             # Si le jeu actuel est dans la fenêtre de vérification (de N+0 à N+r_offset)
-            # La fenêtre va de pred_game_number (N+0) à pred_game_number + r_offset
             if pred_game_number <= current_game_number <= pred_game_number + r_offset:
                 
                 # Vérifier si la couleur prédite est dans le PREMIER groupe
@@ -418,9 +510,8 @@ async def process_verification(message_text: str):
                     await update_prediction_status(pred_game_number, '❌')
                 
                 else:
-                    # ÉCHEC (Essai non final), on incrémente le compteur pour le prochain jeu
+                    # ÉCHEC (Essai non final)
                     pred['verification_attempt'] += 1
-                    # Note: On ne met pas à jour le statut du message ici, on attend soit le succès, soit l'échec final.
                     logger.info(f"⏳ Jeu #{current_game_number}: {SUIT_DISPLAY.get(target_suit, target_suit)} non trouvé. Continue vérification pour #{pred_game_number} (Essai: {pred['verification_attempt']})")
 
     except Exception as e:
@@ -537,7 +628,7 @@ def is_admin(sender_id):
 async def cmd_start(event):
     if event.is_group or event.is_channel:
         return
-    await event.respond("🤖 **Bot de Prédiction Baccarat**\n\nCommandes: `/status`, `/help`, `/debug`, `/deploy`, `/reset`, `/a`, `/r`")
+    await event.respond("🤖 **Bot de Prédiction Baccarat**\n\nCommandes: `/status`, `/help`, `/debug`, `/deploy`, `/reset`, `/a`, `/r`, `/time`, `/ec`")
 
 @client.on(events.NewMessage(pattern='/status'))
 async def cmd_status(event):
@@ -580,6 +671,32 @@ async def cmd_debug(event):
     
     emojis = ", ".join([f"{VERIFICATION_EMOJIS[i]}" for i in range(R_OFFSET + 1)])
 
+    # Statut /time
+    time_status = "Inactif"
+    if prediction_block_until and prediction_block_until > datetime.now():
+        remaining_seconds = (prediction_block_until - datetime.now()).total_seconds()
+        time_status = f"Bloqué ({remaining_seconds:.1f}s restantes)"
+    
+    # Statut /ec
+    ec_status = "Inactif"
+    ec_info = ""
+    if ec_active and ec_gaps:
+        gaps_str_display = ", ".join(map(str, ec_gaps))
+        current_gap = ec_gaps[ec_gap_index] if ec_gaps else 'N/A'
+        
+        ec_status = f"ACTIF (Écarts: {gaps_str_display})"
+        
+        if ec_last_source_game == 0:
+             ec_next_anchor = "En attente de P1..."
+        elif not ec_first_trigger_done:
+            ec_next_anchor = f"Prochaine ancre pour P2: #{ec_last_source_game} + Gap {current_gap} = #{ec_last_source_game + current_gap}"
+        else:
+             ec_next_anchor = f"Prochaine ancre: #{ec_last_source_game} + Gap {current_gap} = #{ec_last_source_game + current_gap}"
+
+
+        ec_info = f"• Ancre Source Précédente: #{ec_last_source_game}\n• Écart/Index Actuel: {current_gap}/{ec_gap_index}\n• {ec_next_anchor}"
+
+
     debug_msg = f"""🔍 **Informations de débogage:**
 
 **Configuration:**
@@ -592,20 +709,17 @@ async def cmd_debug(event):
 • Canal prédiction: {'✅ OK' if prediction_channel_ok else '❌ Non accessible'}
 
 **Offsets (Persistants):**
-• A_OFFSET (/a): N + {A_OFFSET} (Prédiction pour N + A_OFFSET)
-• R_OFFSET (/r): {R_OFFSET} (Vérification de N+0 à N+R_OFFSET)
-• Emojis de succès: {emojis}
+• A_OFFSET (/a): N + {A_OFFSET} (Utilisé par défaut ou si /ec actif)
+• R_OFFSET (/r): {R_OFFSET}
+
+**Modes Spéciaux:**
+• Blocage /time: {time_status} (Ignoré si /ec actif)
+• Mode /ec: {ec_status}
+{ec_info}
 
 **État:**
 • Jeu actuel: #{current_game_number}
 • Prédictions actives: {len(pending_predictions)}
-
-**Règles de transformation (Mise à jour):**
-• Dépend de la parité du Jeu (N) ET de la parité de la carte (Paire/Impaire) du 2ème groupe.
-
-**Reset automatique:**
-• Toutes les 2 heures
-• Quotidien à 00h59 WAT
 """
     await event.respond(debug_msg)
 
@@ -616,31 +730,21 @@ async def cmd_help(event):
 
     await event.respond("""📖 **Aide - Bot de Prédiction Baccarat**
 
-**Règles de prédiction (Mise à Jour!):**
-Le bot lit la 1ère carte (Valeur et Couleur) du 2ème groupe du message source.
-La prédiction est envoyée IMMÉDIATEMENT pour le jeu **N + A_OFFSET**.
-
-**Logique de Transformation (Complexe):**
-La transformation dépend de la **parité du jeu (N)** et de la **parité de la carte (Paire/Impaire)**.
+**Règles de prédiction:**
+La transformation dépend de la **parité du jeu (N)** et de la **parité de la carte (Paire/Impaire)**. La prédiction est TOUJOURS pour le jeu **N + A_OFFSET** (où N est le jeu source).
 
 **Vérification:**
-Attend que le message soit finalisé (✅ ou 🔰).
 Vérifie si le costume prédit est dans le PREMIER groupe pour les jeux **N+0 à N+R_OFFSET**.
 
-**Reset automatique:**
-• Toutes les 2 heures
-• Quotidien à 00h59 WAT (Heure du Bénin)
-
 **Commandes Administrateur:**
-• `/a [valeur]` - Définit l'offset de prédiction (défaut: 1)
-• `/r [valeur]` - Définit le nombre d'essais de vérification (0 à 10, défaut: 0)
+• `/a [valeur]` - Offset de prédiction standard (défaut: 1)
+• `/r [valeur]` - Nombre d'essais de vérification (0 à 10, défaut: 0)
+• `/time [secondes]` - **BLOQUE** temporairement l'envoi de nouvelles prédictions (mode standard uniquement). (`/time 0` pour débloquer).
+• `/ec [e1,e2,...]` - **MODE ÉCART PERSONNALISÉ**. Prend le contrôle du déclenchement des prédictions. **Ignore** `/time`. (Ex: `/ec 3,4,5`). Utilisez `/ec 0` pour désactiver.
 • `/status` - Voir les prédictions actives
 • `/debug` - Informations système
 • `/reset` - Reset manuel des prédictions
 • `/deploy` - Télécharger le bot pour Render.com
-• `/transfert` - Activer le transfert des messages
-• `/stoptransfert` - Désactiver le transfert
-• `/help` - Cette aide
 """)
 
 @client.on(events.NewMessage(pattern='/a(?: (\d+))?'))
@@ -691,6 +795,140 @@ La vérification se fera de N+0 à N+{R_OFFSET}.
 La vérification se fait sur **{R_OFFSET + 1}** jeux (N+0 à N+{R_OFFSET}).
 \n**Émojis de succès:** {emojis}
 \nUtilisation: `/r [valeur]` (ex: `/r 2`)""")
+        
+@client.on(events.NewMessage(pattern='/time(?: (\d+))?'))
+async def cmd_time(event):
+    """
+    Bloque la génération de nouvelles prédictions pendant une durée spécifiée.
+    """
+    if event.is_group or event.is_channel:
+        return
+    if not is_admin(event.sender_id):
+        await event.respond("Commande réservée à l'administrateur")
+        return
+    
+    global prediction_block_until, ec_active
+    
+    match = re.match(r'/time (\d+)', event.message.message)
+    current_time = datetime.now()
+    wat_tz = timezone(timedelta(hours=1)) # Pour l'affichage à l'utilisateur
+
+    if ec_active:
+        await event.respond("❌ **Le mode `/ec` est actif et a la priorité.** Le blocage `/time` est ignoré.")
+        return
+
+    if match:
+        duration_seconds = int(match.group(1))
+        
+        if duration_seconds == 0:
+            prediction_block_until = None
+            await event.respond("✅ **Blocage des prédictions levé.**\n\nLe bot reprendra les prédictions au prochain jeu.")
+            logger.warning("Blocage des prédictions levé manuellement.")
+            return
+
+        if duration_seconds > 7200: # Limite à 2 heures (7200 secondes)
+            await event.respond("❌ La durée maximale autorisée pour le blocage est de 7200 secondes (2 heures).")
+            return
+
+        block_end_time = current_time + timedelta(seconds=duration_seconds)
+        prediction_block_until = block_end_time
+        
+        end_time_wat = block_end_time.astimezone(wat_tz).strftime("%H:%M:%S WAT")
+        
+        await event.respond(f"⛔ **Blocage des prédictions activé.**\n\nDurée: **{duration_seconds} secondes** ({duration_seconds/60:.2f} minutes).\nReprise des prédictions à **{end_time_wat}**.")
+        logger.warning(f"Prédictions bloquées pendant {duration_seconds} secondes. Reprise à {prediction_block_until.isoformat()}")
+        
+    else:
+        # Vérifier le statut actuel si aucun argument n'est fourni
+        if prediction_block_until and prediction_block_until > current_time:
+            remaining_seconds = (prediction_block_until - current_time).total_seconds()
+            end_time_wat = prediction_block_until.astimezone(wat_tz).strftime("%H:%M:%S WAT")
+            
+            await event.respond(f"ℹ️ **Statut actuel: BLOQUÉ**\n\nFin du blocage à **{end_time_wat}** (Reste {remaining_seconds:.1f} secondes).\n\nPour débloquer: `/time 0`. Pour bloquer: `/time [secondes]`.")
+        else:
+            prediction_block_until = None
+            await event.respond("ℹ️ **Statut actuel: ACTIF**\n\nUtilisation: `/time [secondes]` (ex: `/time 120` pour bloquer 2 minutes). Utilisez `/time 0` pour débloquer immédiatement.")
+
+@client.on(events.NewMessage(pattern='/ec(?: (.+))?'))
+async def cmd_ec(event):
+    """
+    Active le mode Écart Personnalisé (ec) et désactive le blocage /time.
+    """
+    if event.is_group or event.is_channel:
+        return
+    if not is_admin(event.sender_id):
+        await event.respond("Commande réservée à l'administrateur")
+        return
+    
+    global ec_active, ec_gaps, ec_gap_index, ec_last_source_game, ec_first_trigger_done, prediction_block_until, current_game_number
+    
+    match = re.match(r'/ec (.+)', event.message.message)
+    
+    if match:
+        gap_str = match.group(1).strip()
+        
+        # Commande /ec 0 ou /ec OFF pour désactiver
+        if gap_str.upper() in ['0', 'OFF', 'STOP']:
+            ec_active = False
+            ec_gaps = []
+            ec_gap_index = 0
+            ec_last_source_game = 0
+            ec_first_trigger_done = False
+            save_config()
+            await event.respond("✅ **Mode Écart Personnalisé (/ec) désactivé.**\n\nLe bot revient à l'offset de prédiction standard (`/a`).")
+            return
+
+        # Parse les écarts (doivent être des entiers positifs)
+        try:
+            gaps = [int(g.strip()) for g in gap_str.split(',') if g.strip()]
+            if not gaps or any(g <= 0 for g in gaps):
+                raise ValueError("Les écarts doivent être des entiers positifs (séparés par des virgules).")
+        except ValueError as e:
+            await event.respond(f"❌ Erreur de format: {e}. Format attendu: `/ec 3,4,5` (entiers positifs).")
+            return
+
+        ec_active = True
+        ec_gaps = gaps
+        ec_gap_index = 0
+        ec_last_source_game = 0 # Reset l'ancre pour forcer le P1 initial
+        ec_first_trigger_done = False # Doit lancer P1 d'abord
+        
+        # Le blocage /time n'est pas nécessaire, car la logique /ec l'ignore, mais on le clear pour la clarté.
+        if prediction_block_until:
+            prediction_block_until = None
+            await event.respond("⚠️ Le blocage `/time` a été levé automatiquement (priorité à `/ec`).")
+
+        save_config()
+        
+        gaps_str_display = ", ".join(map(str, ec_gaps))
+        await event.respond(f"""✅ **Mode Écart Personnalisé (/ec) activé!**
+\n**Écarts définis ({len(ec_gaps)}):** {gaps_str_display}
+\n**Prochaine prédiction (P1):** Se déclenchera sur le prochain jeu source reçu (N) et prédira pour **N + A_OFFSET** (`/a {A_OFFSET}`).
+\n**P2 et suivants:** Se déclencheront lorsque le numéro source sera le **dernier N + le prochain écart** (Ex: 100 + {gaps[0]}).
+\nPour désactiver: `/ec 0` ou `/ec off`""")
+
+    else:
+        # Afficher le statut actuel
+        if ec_active and ec_gaps:
+            gaps_str_display = ", ".join(map(str, ec_gaps))
+            current_gap = ec_gaps[ec_gap_index] if ec_gaps else 'N/A'
+            
+            status_msg = f"ℹ️ **Mode Écart Personnalisé (/ec) ACTIF**\n"
+            status_msg += f"**Écarts définis:** {gaps_str_display}\n"
+
+            if not ec_first_trigger_done:
+                status_msg += "**Statut:** En attente de la première prédiction (P1) sur le prochain jeu source (N)."
+            else:
+                next_required = ec_last_source_game + current_gap
+                status_msg += f"**Prochain écart utilisé:** {current_gap} (Index {ec_gap_index} / {len(ec_gaps)})\n"
+                status_msg += f"**Ancre du dernier N prédit:** #{ec_last_source_game}\n"
+                status_msg += f"**Jeu source minimum requis pour P{ec_gap_index + 2}:** **#{next_required}**"
+            
+            status_msg += "\n\nUtilisation: `/ec 3,4,5` ou `/ec 0` pour désactiver."
+        else:
+            status_msg = "ℹ️ **Mode Écart Personnalisé (/ec) INACTIF**\n\nUtilisation: `/ec 3,4,5` pour définir la séquence d'écarts. Le bot se base sur le dernier numéro source (N) pour calculer le numéro source minimum pour la prédiction suivante (N + écart)."
+            
+        await event.respond(status_msg)
 
 @client.on(events.NewMessage(pattern='/transfert|/activetransfert'))
 async def cmd_active_transfert(event):
@@ -731,7 +969,7 @@ async def cmd_deploy(event):
             shutil.rmtree(deploy_dir)
         os.makedirs(deploy_dir)
 
-        # Création de config.py (utilise le contenu mis à jour)
+        # Création de config.py
         config_content = '''"""
 Configuration du bot Telegram de prédiction Baccarat
 """
@@ -786,11 +1024,7 @@ VERIFICATION_EMOJIS = {
         with open(os.path.join(deploy_dir, 'config.py'), 'w', encoding='utf-8') as f:
             f.write(config_content)
 
-        # Copie de main.py (utilise le contenu mis à jour)
-        # Note: Cette partie du code de la commande /deploy utilise le fichier main.py qui est
-        # le code en cours d'exécution. Nous devons nous assurer que le fichier main.py
-        # dans le ZIP contient la nouvelle logique. Comme le script actuel
-        # EST la nouvelle logique, on utilise son contenu.
+        # Copie de main.py
         with open('main.py', 'r', encoding='utf-8') as f:
             main_content = f.read()
         with open(os.path.join(deploy_dir, 'main.py'), 'w', encoding='utf-8') as f:
@@ -851,17 +1085,15 @@ openpyxl==3.1.2
 ## Règles de Prédiction (Mise à Jour)
 
 **Configuration par commandes:**
-- `/a [valeur]`: Offset de prédiction (N -> N + A_OFFSET)
+- `/a [valeur]`: Offset de prédiction standard (N -> N + A_OFFSET)
 - `/r [valeur]`: Nombre d'essais de vérification (N+0 à N+R_OFFSET)
+- `/time [secondes]`: Bloque temporairement les prédictions (mode standard).
+- `/ec [e1,e2,...]`: **Mode Écart Personnalisé** (Désactive/Ignore `/time`).
 
-**Prédiction (immédiate):**
-- Lit la 1ère carte (Valeur et Couleur) du 2ème groupe.
-- Applique la nouvelle transformation complexe dépendante de la **parité du jeu** et de la **parité de la carte (Paire/Impaire)**.
-- Prédit pour le jeu **N + A_OFFSET**
-
-**Vérification (après finalisation):**
-- Vérifie si le costume prédit est dans le 1er groupe
-- La vérification se fait sur les jeux consécutifs **N+0 jusqu'à N+R_OFFSET**.
+**Nouvelle Logique /ec (Écart sur le Numéro Source):**
+- La première prédiction (P1) se fait sur le prochain jeu source reçu (N -> N + A_OFFSET).
+- Les prédictions suivantes (P2, P3...) se font seulement lorsque le numéro source atteint **[Ancre N précédente + Écart actuel]**.
+- La prédiction cible reste toujours **N_source + A_OFFSET**.
 
 **Reset automatique:**
 - Toutes les 2 heures
@@ -875,8 +1107,17 @@ openpyxl==3.1.2
             os.remove(zip_path)
 
         # Inclusion d'un fichier bot_config.json vide pour le déploiement initial
+        initial_config = {
+            'a_offset': A_OFFSET_DEFAULT, 
+            'r_offset': R_OFFSET_DEFAULT,
+            'ec_active': False,
+            'ec_gaps': [],
+            'ec_gap_index': 0,
+            'ec_last_source_game': 0,
+            'ec_first_trigger_done': False
+        }
         with open(os.path.join(deploy_dir, CONFIG_FILE), 'w', encoding='utf-8') as f:
-            json.dump({'a_offset': A_OFFSET_DEFAULT, 'r_offset': R_OFFSET_DEFAULT}, f, indent=4)
+            json.dump(initial_config, f, indent=4)
 
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
             for root, dirs, files in os.walk(deploy_dir):
@@ -888,7 +1129,7 @@ openpyxl==3.1.2
         await client.send_file(
             event.chat_id,
             zip_path,
-            caption=f"📦 **ren.zip**\n\nFichier prêt pour déploiement sur Render.com (port 10000)\n\nContenu:\n• main.py (nouvelle logique complexe)\n• config.py\n• requirements.txt\n• render.yaml\n• README.md\n• **bot_config.json** (pour persistance)\n\n**Mises à jour:**\n• Nouvelle règle de prédiction complexe (parité jeu + parité carte)\n• Message de statut de vérification simplifié\n• Persistance des offsets `/a` et `/r`"
+            caption=f"📦 **ren.zip**\n\nFichier prêt pour déploiement sur Render.com (port 10000)\n\n**Mise à jour majeure:**\n• **Nouvelle Logique /ec implémentée** (Écart sur le numéro de jeu source N).\n• Le mode `/ec` ignore désormais le blocage `/time`."
         )
 
         shutil.rmtree(deploy_dir)
@@ -958,7 +1199,7 @@ async def verify_channels():
 async def main():
     """Fonction principale."""
     try:
-        load_config() # Chargement de la config A et R au démarrage
+        load_config() # Chargement de la config A, R et EC au démarrage
         
         await client.start(bot_token=BOT_TOKEN)
         me = await client.get_me()
